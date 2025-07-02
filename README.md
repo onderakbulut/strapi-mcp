@@ -119,6 +119,13 @@ node build/index.js
 
  ## Changelog
  
+ ### 0.1.9 - 2025-01-XX
+ - **CONTEXT WINDOW OVERFLOW FIX:** Added size limits and response filtering to prevent base64 files from overwhelming context window
+ - **NEW TOOL:** Added `upload_media_from_path` - Upload files from local file paths (max 10MB) to avoid base64 context issues
+ - **ENHANCED UPLOAD_MEDIA:** Added 1MB base64 size limit (~750KB file) with clear error messages about context overflow
+ - **IMPROVED LOGGING:** Truncated base64 data in logs to prevent log spam and context overflow
+ - **RESPONSE FILTERING:** Automatically filters large base64 strings from API responses to prevent echo overflow
+ 
  ### 0.1.8 - 2025-06-12
  - **MAJOR BUG FIX:** Replaced silent failures with descriptive error messages when content types or entries cannot be fetched
  - **Added Configuration Validation:** Detects placeholder API tokens and exits with helpful error messages
@@ -178,7 +185,8 @@ This is a TypeScript-based MCP server that integrates with Strapi CMS. It provid
 - `create_entry` - Create a new entry for a content type
 - `update_entry` - Update an existing entry
 - `delete_entry` - Delete an entry
-- `upload_media` - Upload a media file to Strapi
+- `upload_media` - Upload a media file to Strapi (max ~750KB file due to base64 context limits)
+- `upload_media_from_path` - Upload a media file from local file path (max 10MB, avoids context overflow)
 - `get_content_type_schema` - Get the schema (fields, types, relations) for a specific content type.
 - `connect_relation` - Connect related entries to an entry's relation field.
 - `disconnect_relation` - Disconnect related entries from an entry's relation field.
@@ -377,15 +385,26 @@ Cannot connect to Strapi instance: Authentication failed. Check your API token o
 - Check admin email/password are correct
 - Ensure the admin user exists and is active
 
-#### 4. **Fake Content Types** (`api::data.data`, `api::error.error`)
+#### 4. **Context Window Overflow with File Uploads**
+```
+Error: Context window overflow due to large base64 strings
+```
+**Problem:** Base64 encoded files can be extremely large (even small images can be 50-100KB of text), causing context window overflow.
+
+**Solutions:**
+- **Use `upload_media_from_path` instead of `upload_media`** for files larger than ~500KB
+- **Reduce file sizes** before uploading (compress images, reduce resolution)
+- **Use smaller files** - the `upload_media` tool has a 1MB base64 limit (~750KB file)
+
+#### 5. **Fake Content Types** (`api::data.data`, `api::error.error`)
 This issue has been **fixed in v0.1.8**. If you still see these, you may be using an older version.
 
-#### 5. **Empty Results vs Errors**
+#### 6. **Empty Results vs Errors**
 As of v0.1.8, the server now clearly distinguishes between:
 - **Empty collections** (content type exists but has no entries) → Returns `{"data": [], "meta": {...}}`
 - **Actual errors** (content type doesn't exist, auth failed, etc.) → Throws descriptive error with troubleshooting steps
 
-#### 6. **Permission Errors**
+#### 7. **Permission Errors**
 ```
 Access forbidden. Your API token may lack necessary permissions.
 ```
@@ -459,6 +478,7 @@ use_mcp_tool(
 
 ### Uploading Media
 
+**Method 1: Base64 upload (small files only)**
 ```
 use_mcp_tool(
   server_name: "strapi-mcp",
@@ -467,6 +487,17 @@ use_mcp_tool(
     "fileData": "base64-encoded-data-here",
     "fileName": "image.jpg",
     "fileType": "image/jpeg"
+  }
+)
+```
+
+**Method 2: File path upload (recommended for larger files)**
+```
+use_mcp_tool(
+  server_name: "strapi-mcp",
+  tool_name: "upload_media_from_path",
+  arguments: {
+    "filePath": "/path/to/your/image.jpg"
   }
 )
 ```

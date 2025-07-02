@@ -1,6 +1,6 @@
 {
    "name": "strapi-mcp",
-   "version": "0.1.8",
+   "version": "0.1.9",
    "description": "An MCP server for your Strapi CMS that provides access to content types and entries through the MCP protocol",
    "private": false,
    "keywords": [
@@ -32,7 +32,8 @@
       "prepare": "npm run build",
       "watch": "tsc --watch",
       "inspector": "npx @modelcontextprotocol/inspector build/index.js",
-      "generate-test-image": "node scripts/generate-test-image.js"
+      "generate-test-image": "node scripts/generate-test-image.js",
+      "context-window-info": "node scripts/context-window-example.js"
    },
    "dependencies": {
       "@modelcontextprotocol/sdk": "1.10.2",

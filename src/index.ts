@@ -916,11 +916,30 @@ async function deleteEntry(contentType: string, id: string): Promise<void> {
 }
 
 /**
- * Upload a media file to Strapi
+ * Upload media file to Strapi
  */
 async function uploadMedia(fileData: string, fileName: string, fileType: string): Promise<any> {
   try {
-    console.error(`[API] Uploading media file: ${fileName}`);
+    console.error(`[API] Uploading media file: ${fileName} (type: ${fileType})`);
+    
+    // Calculate base64 size and warn about large files
+    const base64Size = fileData.length;
+    const estimatedFileSize = Math.round((base64Size * 3) / 4); // Rough file size estimate
+    const estimatedFileSizeMB = (estimatedFileSize / (1024 * 1024)).toFixed(2);
+    
+    console.error(`[API] File size: ~${estimatedFileSizeMB}MB (base64 length: ${base64Size})`);
+    
+    // Add size limits to prevent context window overflow
+    const MAX_BASE64_SIZE = 1024 * 1024; // 1MB of base64 text (~750KB file)
+    if (base64Size > MAX_BASE64_SIZE) {
+      const maxFileSizeMB = ((MAX_BASE64_SIZE * 3) / 4 / (1024 * 1024)).toFixed(2);
+      throw new Error(`File too large. Base64 data is ${base64Size} characters (~${estimatedFileSizeMB}MB file). Maximum allowed is ${MAX_BASE64_SIZE} characters (~${maxFileSizeMB}MB file). Large files cause context window overflow. Consider using smaller files or implementing chunked upload.`);
+    }
+    
+    // Warn about large files that might cause issues
+    if (base64Size > 100000) { // 100KB of base64 text
+      console.error(`[API] Warning: Large file detected (~${estimatedFileSizeMB}MB). This may cause context window issues.`);
+    }
     
     const buffer = Buffer.from(fileData, 'base64');
     
@@ -937,7 +956,10 @@ async function uploadMedia(fileData: string, fileName: string, fileType: string)
       }
     });
     
-    return response.data;
+    // Filter out any base64 data from the response to prevent context overflow
+    const cleanResponse = filterBase64FromResponse(response.data);
+    
+    return cleanResponse;
   } catch (error) {
     console.error(`[Error] Failed to upload media file ${fileName}:`, error);
     throw new McpError(
@@ -945,6 +967,105 @@ async function uploadMedia(fileData: string, fileName: string, fileType: string)
       `Failed to upload media file ${fileName}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
+}
+
+/**
+ * Upload media file from file path (alternative to base64)
+ */
+async function uploadMediaFromPath(filePath: string, fileName?: string, fileType?: string): Promise<any> {
+  try {
+    const fs = await import('fs');
+    const path = await import('path');
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    
+    // Get file stats
+    const stats = fs.statSync(filePath);
+    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+    
+    console.error(`[API] Uploading media file from path: ${filePath} (${fileSizeMB}MB)`);
+    
+    // Add size limits
+    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+    if (stats.size > MAX_FILE_SIZE) {
+      throw new Error(`File too large: ${fileSizeMB}MB. Maximum allowed is 10MB.`);
+    }
+    
+    // Auto-detect fileName and fileType if not provided
+    const actualFileName = fileName || path.basename(filePath);
+    const extension = path.extname(filePath).toLowerCase();
+    
+    let actualFileType = fileType;
+    if (!actualFileType) {
+      // Basic MIME type detection
+      const mimeTypes: Record<string, string> = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.pdf': 'application/pdf',
+        '.txt': 'text/plain',
+        '.json': 'application/json',
+        '.mp4': 'video/mp4',
+        '.avi': 'video/avi',
+        '.mov': 'video/quicktime'
+      };
+      actualFileType = mimeTypes[extension] || 'application/octet-stream';
+    }
+    
+    // Read file and convert to base64
+    const fileBuffer = fs.readFileSync(filePath);
+    const base64Data = fileBuffer.toString('base64');
+    
+    // Use the existing uploadMedia function
+    return await uploadMedia(base64Data, actualFileName, actualFileType);
+    
+  } catch (error) {
+    console.error(`[Error] Failed to upload media file from path ${filePath}:`, error);
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Failed to upload media file from path: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+/**
+ * Filter base64 data from API responses to prevent context overflow
+ */
+function filterBase64FromResponse(data: any): any {
+  if (!data) return data;
+  
+  // If it's an array, filter each item
+  if (Array.isArray(data)) {
+    return data.map(item => filterBase64FromResponse(item));
+  }
+  
+  // If it's an object, process each property
+  if (typeof data === 'object') {
+    const filtered: any = {};
+    
+    for (const [key, value] of Object.entries(data)) {
+      // Skip or truncate fields that might contain base64 data
+      if (typeof value === 'string') {
+        // Check if this looks like base64 data (long string, mostly alphanumeric with +/=)
+        if (value.length > 1000 && /^[A-Za-z0-9+/=]+$/.test(value.substring(0, 100))) {
+          filtered[key] = `[BASE64_DATA_FILTERED - ${value.length} chars]`;
+        } else {
+          filtered[key] = value;
+        }
+      } else {
+        filtered[key] = filterBase64FromResponse(value);
+      }
+    }
+    
+    return filtered;
+  }
+  
+  return data;
 }
 
 /**
@@ -1937,13 +2058,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "upload_media",
-        description: "Upload a media file to the Strapi Media Library.",
+        description: "Upload a media file to the Strapi Media Library. Maximum size: ~750KB file (1MB base64). For larger files, use upload_media_from_path.",
         inputSchema: {
           type: "object",
           properties: {
             fileData: {
               type: "string",
-              description: "Base64 encoded string of the file data.",
+              description: "Base64 encoded string of the file data. Large files cause context window overflow.",
             },
             fileName: {
               type: "string",
@@ -1955,6 +2076,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["fileData", "fileName", "fileType"]
+        }
+      },
+      {
+        name: "upload_media_from_path",
+        description: "Upload a media file from a local file path. Avoids context window overflow issues. Maximum size: 10MB.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: {
+              type: "string",
+              description: "Local file system path to the file to upload.",
+            },
+            fileName: {
+              type: "string",
+              description: "Optional: Override the file name. If not provided, uses the original filename.",
+            },
+            fileType: {
+              type: "string",
+              description: "Optional: Override the MIME type. If not provided, auto-detects from file extension.",
+            },
+          },
+          required: ["filePath"]
         }
       },
       {
@@ -2333,7 +2476,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           );
         }
         
+        // Log a truncated version of the fileData to avoid context overflow in logs
+        const truncatedFileData = fileData.length > 100 ? `${fileData.substring(0, 100)}... [${fileData.length} chars total]` : fileData;
+        console.error(`[API] Received base64 upload request: fileName=${fileName}, fileType=${fileType}, data=${truncatedFileData}`);
+        
         const media = await uploadMedia(fileData, fileName, fileType);
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(media, null, 2)
+          }]
+        };
+      }
+      
+      case "upload_media_from_path": {
+        const filePath = String(request.params.arguments?.filePath);
+        const fileName = request.params.arguments?.fileName ? String(request.params.arguments.fileName) : undefined;
+        const fileType = request.params.arguments?.fileType ? String(request.params.arguments.fileType) : undefined;
+        
+        if (!filePath) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "File path is required"
+          );
+        }
+        
+        const media = await uploadMediaFromPath(filePath, fileName, fileType);
         
         return {
           content: [{
