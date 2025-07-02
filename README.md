@@ -119,7 +119,7 @@ node build/index.js
 
  ## Changelog
  
- ### 0.1.9 - 2025-01-XX
+ ### 0.1.9 - 2025-07-02
  - **CONTEXT WINDOW OVERFLOW FIX:** Added size limits and response filtering to prevent base64 files from overwhelming context window
  - **NEW TOOL:** Added `upload_media_from_path` - Upload files from local file paths (max 10MB) to avoid base64 context issues
  - **ENHANCED UPLOAD_MEDIA:** Added 1MB base64 size limit (~750KB file) with clear error messages about context overflow
