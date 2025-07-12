@@ -1,6 +1,6 @@
 {
    "name": "strapi-mcp-v5",
-   "version": "0.1.9",
+   "version": "0.1.10",
    "description": "An MCP server for your Strapi CMS that provides access to content types and entries through the MCP protocol",
    "private": false,
    "keywords": [
