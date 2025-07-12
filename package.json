@@ -10,15 +10,15 @@
       "mcp",
       "headless-cms"
    ],
-   "author": "l33tdawg <l33tdawg@hackinthebox.org>",
+   "author": "onderakbulut <onderakbulut@yahoo.com>",
    "license": "MIT",
    "repository": {
       "type": "git",
-      "url": "git+https://github.com/l33tdawg/strapi-mcp.git"
+      "url": "git+https://github.com/onderakbulut/strapi-mcp.git"
    },
-   "homepage": "https://github.com/l33tdawg/strapi-mcp#readme",
+   "homepage": "https://github.com/onderakbulut/strapi-mcp#readme",
    "bugs": {
-      "url": "https://github.com/l33tdawg/strapi-mcp/issues"
+      "url": "https://github.com/onderakbulut/strapi-mcp/issues"
    },
    "type": "module",
    "bin": {
