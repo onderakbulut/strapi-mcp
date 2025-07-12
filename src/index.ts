@@ -40,6 +40,154 @@ import dotenv from 'dotenv';
 // Load environment variables from .env file
 dotenv.config();
 
+// ============================================================================
+// TASK 6: ID vs DocumentID Migration
+// ============================================================================
+
+/**
+ * ID Mapping interface for v4 <-> v5 conversion
+ */
+interface IdMapping {
+  v4Id: string | number;
+  v5DocumentId: string;
+  contentType: string;
+  createdAt: string;
+}
+
+/**
+ * ID Mapper class for handling v4 <-> v5 ID conversions
+ */
+class IdMapper {
+  private static mappings: Map<string, IdMapping> = new Map();
+  
+  /**
+   * Map v4 ID to v5 documentId
+   */
+  static mapV4ToV5(v4Id: string | number, contentType: string): string {
+    const key = `${contentType}:${v4Id}`;
+    const mapping = this.mappings.get(key);
+    
+    if (mapping) {
+      return mapping.v5DocumentId;
+    }
+    
+    // Generate v5-style documentId if not found
+    const documentId = `${contentType.replace(/[^a-zA-Z0-9]/g, '_')}_${v4Id}_${Date.now()}`;
+    
+    this.mappings.set(key, {
+      v4Id,
+      v5DocumentId: documentId,
+      contentType,
+      createdAt: new Date().toISOString()
+    });
+    
+    return documentId;
+  }
+  
+  /**
+   * Map v5 documentId to v4 ID
+   */
+  static mapV5ToV4(documentId: string, contentType: string): string | number {
+    for (const [key, mapping] of this.mappings) {
+      if (mapping.v5DocumentId === documentId && mapping.contentType === contentType) {
+        return mapping.v4Id;
+      }
+    }
+    
+    // Extract numeric ID if possible
+    const numericMatch = documentId.match(/(\d+)/);
+    if (numericMatch) {
+      return parseInt(numericMatch[1], 10);
+    }
+    
+    return documentId;
+  }
+  
+  /**
+   * Clear mappings for testing
+   */
+  static clearMappings(): void {
+    this.mappings.clear();
+  }
+}
+
+/**
+ * ID Parameter Handler for resolving ID parameters based on Strapi version
+ */
+class IdParameterHandler {
+  /**
+   * Resolve ID parameter based on Strapi version
+   */
+  static resolveIdParameter(id: string, contentType: string): { param: string; value: string } {
+    if (detectedStrapiVersion === 'v5') {
+      // v5 uses documentId
+      if (this.isDocumentId(id)) {
+        return { param: 'documentId', value: id };
+      }
+      // Convert numeric ID to documentId if needed
+      const documentId = IdMapper.mapV4ToV5(id, contentType);
+      return { param: 'documentId', value: documentId };
+    } else {
+      // v4 uses id
+      if (this.isDocumentId(id)) {
+        const numericId = IdMapper.mapV5ToV4(id, contentType);
+        return { param: 'id', value: numericId.toString() };
+      }
+      return { param: 'id', value: id };
+    }
+  }
+  
+  /**
+   * Check if value looks like a documentId
+   */
+  private static isDocumentId(value: string): boolean {
+    // documentId is typically a string with letters and length > 10
+    return /[a-zA-Z]/.test(value) && value.length > 10;
+  }
+  
+  /**
+   * Build endpoint with correct ID parameter
+   */
+  static buildEndpoint(baseEndpoint: string, id: string, contentType: string): string {
+    const { param, value } = this.resolveIdParameter(id, contentType);
+    
+    if (detectedStrapiVersion === 'v5') {
+      // v5 uses documentId in path
+      return `${baseEndpoint}/${value}`;
+    } else {
+      // v4 uses id in path
+      return `${baseEndpoint}/${value}`;
+    }
+  }
+}
+
+/**
+ * ID Error Handler for handling ID-related errors
+ */
+class IdErrorHandler {
+  /**
+   * Handle ID-related errors
+   */
+  static handleIdError(error: any, id: string, contentType: string): Error {
+    const errorMessage = error.message || error.toString();
+    
+    // Check for common ID-related errors
+    if (errorMessage.includes('documentId') && detectedStrapiVersion === 'v4') {
+      return new Error(`ID format mismatch: Trying to use documentId '${id}' with v4 instance. Expected numeric ID.`);
+    }
+    
+    if (errorMessage.includes('not found') || errorMessage.includes('404')) {
+      return new Error(`Entry not found: ${contentType}/${id}. Check if ID format is correct for ${detectedStrapiVersion}.`);
+    }
+    
+    if (errorMessage.includes('invalid') && errorMessage.includes('id')) {
+      return new Error(`Invalid ID format: '${id}' for ${detectedStrapiVersion}. Expected ${detectedStrapiVersion === 'v5' ? 'documentId (string)' : 'id (number)'}.`);
+    }
+    
+    return error;
+  }
+}
+
 // Extended error codes to include additional ones we need
 enum ExtendedErrorCode {
   // Original error codes from SDK
@@ -97,6 +245,676 @@ const STRAPI_API_TOKEN = process.env.STRAPI_API_TOKEN;
 const STRAPI_DEV_MODE = process.env.STRAPI_DEV_MODE === "true";
 const STRAPI_ADMIN_EMAIL = process.env.STRAPI_ADMIN_EMAIL;
 const STRAPI_ADMIN_PASSWORD = process.env.STRAPI_ADMIN_PASSWORD;
+const STRAPI_VERSION = process.env.STRAPI_VERSION || "v5";
+
+// Global version variable
+let detectedStrapiVersion: string = "v5";
+
+// Authentication State Management
+interface AuthState {
+  isAuthenticated: boolean;
+  token: string | null;
+  user: any | null;
+  lastAuthTime: number;
+  tokenExpiry: number | null;
+}
+
+let authState: AuthState = {
+  isAuthenticated: false,
+  token: null,
+  user: null,
+  lastAuthTime: 0,
+  tokenExpiry: null
+};
+
+/**
+ * Detect Strapi version from environment or API
+ */
+async function detectStrapiVersion(): Promise<string> {
+  // Önce environment variable'ı kontrol et
+  if (process.env.STRAPI_VERSION) {
+    console.error(`[Version] Using environment variable: ${process.env.STRAPI_VERSION}`);
+    return process.env.STRAPI_VERSION;
+  }
+  
+  // v5 olarak ayarla
+  console.error(`[Version] No version specified, defaulting to v5`);
+  return "v5";
+}
+
+// ============================================================================
+// TASK 3: BACKWARD COMPATIBILITY HEADERS
+// ============================================================================
+
+/**
+ * Interface for request headers with compatibility support
+ */
+interface RequestHeaders {
+  'Content-Type': string;
+  'Authorization'?: string;
+  'X-Strapi-Response-Format'?: string;
+  [key: string]: string | undefined;
+}
+
+/**
+ * Build headers with v4 compatibility for v5 instances
+ */
+function buildHeaders(endpoint: string, customHeaders: any = {}): RequestHeaders {
+  const headers: RequestHeaders = {
+    'Content-Type': 'application/json',
+    ...customHeaders
+  };
+  
+  // v5 için v4 uyumluluk header'ı ekle
+  if (detectedStrapiVersion === 'v5') {
+    headers['X-Strapi-Response-Format'] = 'v4';
+    console.error(`[Headers] Added v4 compatibility header for v5 instance`);
+  }
+  
+  // Authentication token ekle
+  if (authState.token && endpoint !== '/admin/login') {
+    headers['Authorization'] = `Bearer ${authState.token}`;
+  }
+  
+  // Debug logging
+  console.error(`[Headers] Request to ${endpoint}:`, Object.keys(headers));
+  
+  return headers;
+}
+
+/**
+ * Validate response format (v4 vs v5)
+ */
+function validateResponseFormat(data: any, endpoint: string): void {
+  // v4 format validation
+  if (detectedStrapiVersion === 'v5') {
+    // v5'te v4 uyumluluk header'ı ile v4 format'ı bekliyoruz
+    if (data.data !== undefined) {
+      console.error(`[Validation] ✅ v4 format detected for ${endpoint}`);
+    } else {
+      console.error(`[Validation] ⚠️ Unexpected format for ${endpoint}:`, Object.keys(data));
+    }
+  } else {
+    // v4'te normal v4 format
+    if (data.data !== undefined) {
+      console.error(`[Validation] ✅ v4 format confirmed for ${endpoint}`);
+    } else {
+      console.error(`[Validation] ⚠️ Non-standard format for ${endpoint}:`, Object.keys(data));
+    }
+  }
+}
+
+/**
+ * Log request summary for debugging
+ */
+function logRequestSummary(endpoint: string, headers: RequestHeaders, responseData: any): void {
+  console.error(`[Summary] ${endpoint}:`);
+  console.error(`  - Version: ${detectedStrapiVersion}`);
+  console.error(`  - Compatibility Header: ${headers['X-Strapi-Response-Format'] || 'none'}`);
+  console.error(`  - Auth: ${headers['Authorization'] ? 'Bearer ***' : 'none'}`);
+  console.error(`  - Response Type: ${responseData.data ? 'v4 format' : 'other'}`);
+  console.error(`  - Status: ✅ Success`);
+}
+
+/**
+ * Content-Type specific JSON request
+ */
+async function makeJSONRequest(endpoint: string, options: any = {}): Promise<any> {
+  return makeRequest(endpoint, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  });
+}
+
+/**
+ * FormData request (Content-Type otomatik set edilir)
+ */
+async function makeFormDataRequest(endpoint: string, formData: FormData): Promise<any> {
+  return makeRequest(endpoint, {
+    method: 'POST',
+    body: formData,
+    headers: {
+      // FormData için Content-Type header'ı otomatik set edilir
+      // 'Content-Type': 'multipart/form-data' // Bu otomatik
+    }
+  });
+}
+
+/**
+ * Admin API specific requests
+ */
+async function makeAdminRequest(endpoint: string, options: any = {}): Promise<any> {
+  const adminEndpoint = endpoint.startsWith('/admin') ? endpoint : `/admin${endpoint}`;
+  return makeRequest(adminEndpoint, options);
+}
+
+// ============================================================================
+// END TASK 3: BACKWARD COMPATIBILITY HEADERS
+// ============================================================================
+
+// ============================================================================
+// TASK 4: RESPONSE PARSER REFACTORING
+// ============================================================================
+
+/**
+ * v4 Response Format Interface
+ */
+interface StrapiV4Response<T = any> {
+  data: T;
+  meta?: {
+    pagination?: {
+      page: number;
+      pageSize: number;
+      pageCount: number;
+      total: number;
+    };
+    [key: string]: any;
+  };
+  error?: {
+    status: number;
+    name: string;
+    message: string;
+    details?: any;
+  };
+}
+
+/**
+ * v5 Response Format Interface (native)
+ */
+interface StrapiV5Response<T = any> {
+  data: T; // Direct data, no attributes wrapper
+  meta?: {
+    pagination?: {
+      page: number;
+      pageSize: number;
+      pageCount: number;
+      total: number;
+    };
+    [key: string]: any;
+  };
+  error?: {
+    status: number;
+    name: string;
+    message: string;
+    details?: any;
+  };
+}
+
+/**
+ * Unified Response Interface
+ */
+interface UnifiedResponse<T = any> {
+  data: T;
+  meta?: any;
+  error?: any;
+  format: 'v4' | 'v5';
+}
+
+/**
+ * Response Parser Class
+ */
+class ResponseParser {
+  private version: string;
+  
+  constructor(version: string = 'v4') {
+    this.version = version;
+  }
+  
+  /**
+   * Parse response based on detected format
+   */
+  parse<T = any>(response: any): UnifiedResponse<T> {
+    // Detect format
+    const format = this.detectFormat(response);
+    
+    console.error(`[Parser] Detected format: ${format}`);
+    
+    switch (format) {
+      case 'v4':
+        return this.parseV4Response(response);
+      case 'v5':
+        return this.parseV5Response(response);
+      default:
+        throw new Error(`Unsupported response format: ${format}`);
+    }
+  }
+  
+  /**
+   * Detect response format
+   */
+  private detectFormat(response: any): 'v4' | 'v5' {
+    // Error response check
+    if (response.error) {
+      return 'v4'; // Both versions use similar error format
+    }
+    
+    // v4 format: data with attributes
+    if (response.data && Array.isArray(response.data)) {
+      const firstItem = response.data[0];
+      if (firstItem && firstItem.attributes) {
+        return 'v4';
+      }
+    } else if (response.data && response.data.attributes) {
+      return 'v4';
+    }
+    
+    // v5 format: flat data structure
+    if (response.data && !response.data.attributes) {
+      return 'v5';
+    }
+    
+    // Default to configured version
+    return this.version === 'v5' ? 'v5' : 'v4';
+  }
+  
+  /**
+   * Parse v4 response format
+   */
+  private parseV4Response<T>(response: StrapiV4Response): UnifiedResponse<T> {
+    return {
+      data: response.data,
+      meta: response.meta,
+      error: response.error,
+      format: 'v4'
+    };
+  }
+  
+  /**
+   * Parse v5 response format
+   */
+  private parseV5Response<T>(response: StrapiV5Response): UnifiedResponse<T> {
+    return {
+      data: response.data,
+      meta: response.meta,
+      error: response.error,
+      format: 'v5'
+    };
+  }
+}
+
+/**
+ * Data Transformation Utilities
+ */
+class DataTransformer {
+  /**
+   * Transform v4 data to flat structure (v5-like)
+   */
+  static flattenV4Data(data: any): any {
+    if (!data) return data;
+    
+    if (Array.isArray(data)) {
+      return data.map(item => this.flattenV4Item(item));
+    }
+    
+    return this.flattenV4Item(data);
+  }
+  
+  /**
+   * Transform single v4 item to flat structure
+   */
+  private static flattenV4Item(item: any): any {
+    if (!item || typeof item !== 'object') return item;
+    
+    // v4 format: { id, attributes: { ... } }
+    if (item.id && item.attributes) {
+      return {
+        id: item.id,
+        documentId: item.id, // v5 compatibility
+        ...item.attributes
+      };
+    }
+    
+    return item;
+  }
+  
+  /**
+   * Transform v5 data to v4 structure
+   */
+  static wrapV5Data(data: any): any {
+    if (!data) return data;
+    
+    if (Array.isArray(data)) {
+      return data.map(item => this.wrapV5Item(item));
+    }
+    
+    return this.wrapV5Item(data);
+  }
+  
+  /**
+   * Transform single v5 item to v4 structure
+   */
+  private static wrapV5Item(item: any): any {
+    if (!item || typeof item !== 'object') return item;
+    
+    // v5 format: { documentId, title, ... }
+    if (item.documentId) {
+      const { documentId, ...attributes } = item;
+      return {
+        id: documentId,
+        attributes
+      };
+    }
+    
+    return item;
+  }
+}
+
+// Global parser instance
+const responseParser = new ResponseParser(detectedStrapiVersion);
+
+/**
+ * Enhanced response handler
+ */
+async function handleResponse<T = any>(response: Response, endpoint: string): Promise<UnifiedResponse<T>> {
+  try {
+    const rawData = await response.json();
+    
+    // Parse response with format detection
+    const parsedResponse = responseParser.parse<T>(rawData);
+    
+    // Log parsing result
+    console.error(`[Response] ${endpoint}:`);
+    console.error(`  - Format: ${parsedResponse.format}`);
+    console.error(`  - Data type: ${Array.isArray(parsedResponse.data) ? 'array' : typeof parsedResponse.data}`);
+    console.error(`  - Meta: ${parsedResponse.meta ? 'present' : 'none'}`);
+    
+    return parsedResponse;
+    
+  } catch (error) {
+    console.error(`[Response] Parse error for ${endpoint}:`, error);
+    throw new Error(`Failed to parse response: ${error}`);
+  }
+}
+
+/**
+ * Update response parser version when detected version changes
+ */
+function updateResponseParserVersion(version: string): void {
+  console.error(`[Parser] Updating response parser to version: ${version}`);
+  // Create new parser instance with updated version
+  const newParser = new ResponseParser(version);
+  // Replace the global parser (TypeScript won't allow reassignment of const, so we'll use a different approach)
+  Object.setPrototypeOf(responseParser, newParser);
+  Object.assign(responseParser, newParser);
+}
+
+/**
+ * Enhanced makeRequest with unified response handling
+ */
+async function makeRequestUnified(endpoint: string, options: any = {}): Promise<UnifiedResponse> {
+  console.error(`[Request] Making request to: ${endpoint}`);
+  
+  // Ensure we have authenticated if required
+  if (endpoint !== '/admin/login' && !isTokenValid()) {
+    console.error(`[Request] Token validation failed, attempting to authenticate...`);
+    await ensureAuthenticated();
+  }
+  
+  // Build headers with v4 compatibility
+  const headers = buildHeaders(endpoint, options.headers);
+  
+  const requestOptions = {
+    method: options.method || 'GET',
+    headers: {
+      ...headers,
+      ...options.headers
+    },
+    ...options
+  };
+  
+  try {
+    const response = await fetch(`${STRAPI_URL}${endpoint}`, requestOptions);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[Request] Error ${response.status}:`, errorText);
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    }
+    
+    // Use enhanced response handler
+    return await handleResponse(response, endpoint);
+    
+  } catch (error) {
+    console.error(`[Request] Failed for ${endpoint}:`, error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// END TASK 4: RESPONSE PARSER REFACTORING
+// ============================================================================
+
+// ============================================================================
+// TASK 4: ENHANCED MCP TOOL FUNCTIONS
+// ============================================================================
+
+/**
+ * Enhanced fetchEntries using unified response format
+ */
+async function fetchEntriesUnified(contentType: string, queryParams?: QueryParams): Promise<UnifiedResponse> {
+  try {
+    console.error(`[MCP] Fetching entries for ${contentType} with unified response`);
+    
+    // Use existing fetchEntries function
+    const result = await fetchEntries(contentType, queryParams);
+    
+    // Mock response parsing (since existing function doesn't use actual HTTP responses)
+    const mockResponse = {
+      data: result.data,
+      meta: result.meta
+    };
+    
+    // Parse with unified response parser
+    const parsedResponse = responseParser.parse(mockResponse);
+    
+    // Transform data if needed
+    let transformedData = parsedResponse.data;
+    if (parsedResponse.format === 'v4') {
+      transformedData = DataTransformer.flattenV4Data(parsedResponse.data);
+    }
+    
+    return {
+      data: transformedData,
+      meta: parsedResponse.meta,
+      error: parsedResponse.error,
+      format: parsedResponse.format
+    };
+    
+  } catch (error) {
+    console.error(`[MCP] Enhanced fetchEntries error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Enhanced fetchEntry using unified response format
+ */
+async function fetchEntryUnified(contentType: string, id: string, queryParams?: QueryParams): Promise<UnifiedResponse> {
+  try {
+    console.error(`[MCP] Fetching entry ${id} for ${contentType} with unified response`);
+    
+    // Use existing fetchEntry function
+    const result = await fetchEntry(contentType, id, queryParams);
+    
+    // Mock response parsing (since existing function doesn't use actual HTTP responses)
+    const mockResponse = {
+      data: result
+    };
+    
+    // Parse with unified response parser
+    const parsedResponse = responseParser.parse(mockResponse);
+    
+    // Transform data if needed
+    let transformedData = parsedResponse.data;
+    if (parsedResponse.format === 'v4') {
+      transformedData = DataTransformer.flattenV4Data(parsedResponse.data);
+    }
+    
+    return {
+      data: transformedData,
+      meta: parsedResponse.meta,
+      error: parsedResponse.error,
+      format: parsedResponse.format
+    };
+    
+  } catch (error) {
+    console.error(`[MCP] Enhanced fetchEntry error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Enhanced createEntry using unified response format
+ */
+async function createEntryUnified(contentType: string, data: any): Promise<UnifiedResponse> {
+  try {
+    console.error(`[MCP] Creating entry for ${contentType} with unified response`);
+    
+    // Transform data based on target version
+    let transformedData = data;
+    if (detectedStrapiVersion === 'v4') {
+      // v4 expects wrapped data
+      transformedData = data;
+    } else {
+      // v5 uses flat data structure
+      transformedData = data;
+    }
+    
+    // Use existing createEntry function
+    const result = await createEntry(contentType, transformedData);
+    
+    // Mock response parsing
+    const mockResponse = {
+      data: result
+    };
+    
+    // Parse with unified response parser
+    const parsedResponse = responseParser.parse(mockResponse);
+    
+    return {
+      data: parsedResponse.data,
+      meta: parsedResponse.meta,
+      error: parsedResponse.error,
+      format: parsedResponse.format
+    };
+    
+  } catch (error) {
+    console.error(`[MCP] Enhanced createEntry error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Enhanced updateEntry using unified response format
+ */
+async function updateEntryUnified(contentType: string, id: string, data: any): Promise<UnifiedResponse> {
+  try {
+    console.error(`[MCP] Updating entry ${id} for ${contentType} with unified response`);
+    
+    // Transform data based on target version
+    let transformedData = data;
+    if (detectedStrapiVersion === 'v4') {
+      // v4 expects certain format
+      transformedData = data;
+    } else {
+      // v5 uses flat data structure
+      transformedData = data;
+    }
+    
+    // Use existing updateEntry function
+    const result = await updateEntry(contentType, id, transformedData);
+    
+    // Mock response parsing
+    const mockResponse = {
+      data: result
+    };
+    
+    // Parse with unified response parser
+    const parsedResponse = responseParser.parse(mockResponse);
+    
+    return {
+      data: parsedResponse.data,
+      meta: parsedResponse.meta,
+      error: parsedResponse.error,
+      format: parsedResponse.format
+    };
+    
+  } catch (error) {
+    console.error(`[MCP] Enhanced updateEntry error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Enhanced deleteEntry using unified response format
+ */
+async function deleteEntryUnified(contentType: string, id: string): Promise<UnifiedResponse> {
+  try {
+    console.error(`[MCP] Deleting entry ${id} for ${contentType} with unified response`);
+    
+    // Use existing deleteEntry function
+    await deleteEntry(contentType, id);
+    
+    // Mock success response
+    const mockResponse = {
+      data: { message: `Entry ${id} deleted successfully` },
+      meta: {}
+    };
+    
+    // Parse with unified response parser
+    const parsedResponse = responseParser.parse(mockResponse);
+    
+    return {
+      data: parsedResponse.data,
+      meta: parsedResponse.meta,
+      error: parsedResponse.error,
+      format: parsedResponse.format
+    };
+    
+  } catch (error) {
+    console.error(`[MCP] Enhanced deleteEntry error:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Enhanced listContentTypes using unified response format
+ */
+async function listContentTypesUnified(): Promise<UnifiedResponse> {
+  try {
+    console.error(`[MCP] Listing content types with unified response`);
+    
+    // Use existing fetchContentTypes function
+    const result = await fetchContentTypes();
+    
+    // Mock response parsing
+    const mockResponse = {
+      data: result,
+      meta: { total: result.length }
+    };
+    
+    // Parse with unified response parser
+    const parsedResponse = responseParser.parse(mockResponse);
+    
+    return {
+      data: parsedResponse.data,
+      meta: parsedResponse.meta,
+      error: parsedResponse.error,
+      format: parsedResponse.format
+    };
+    
+  } catch (error) {
+    console.error(`[MCP] Enhanced listContentTypes error:`, error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// END TASK 4: ENHANCED MCP TOOL FUNCTIONS
+// ============================================================================
 
 // Validate required environment variables
 if (!STRAPI_API_TOKEN && !(STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD)) {
@@ -149,6 +967,128 @@ if (STRAPI_API_TOKEN) {
 let adminJwtToken: string | null = null;
 
 /**
+ * Enhanced admin authentication with state management and v4 compatibility
+ */
+async function authenticateAdmin(identifier: string, password: string): Promise<boolean> {
+  try {
+    console.error(`[Auth] Attempting admin login for: ${identifier}`);
+    
+    // Build headers with v4 compatibility
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+    
+    // Add v4 compatibility header for v5
+    if (detectedStrapiVersion === 'v5') {
+      headers['X-Strapi-Response-Format'] = 'v4';
+      console.error(`[Admin API] Adding v4 compatibility header for Strapi v5`);
+    }
+    
+    const response = await axios.post(`${STRAPI_URL}/admin/login`, {
+      email: identifier,
+      password: password
+    }, { headers });
+    
+    console.error(`[Auth] Response status: ${response.status}`);
+    
+    // Handle different response formats (v4 vs v5)
+    let jwtToken = null;
+    let userData = null;
+    
+    if (response.data?.data?.token) {
+      // v4 format: { data: { token: "...", user: {...} } }
+      jwtToken = response.data.data.token;
+      userData = response.data.data.user;
+    } else if (response.data?.jwt) {
+      // Alternative format: { jwt: "...", user: {...} }
+      jwtToken = response.data.jwt;
+      userData = response.data.user;
+    }
+    
+    if (jwtToken) {
+      // Update auth state
+      authState.token = jwtToken;
+      authState.user = userData;
+      authState.isAuthenticated = true;
+      authState.lastAuthTime = Date.now();
+      
+      // Legacy token storage for backward compatibility
+      adminJwtToken = jwtToken;
+      
+      // Token expiry calculation (JWT decode)
+      try {
+        const payload = JSON.parse(atob(jwtToken.split('.')[1]));
+        authState.tokenExpiry = payload.exp * 1000; // Convert to milliseconds
+        console.error(`[Auth] Token expires at: ${new Date(authState.tokenExpiry).toISOString()}`);
+      } catch (e) {
+        console.error('[Auth] Could not decode JWT expiry, using 5-minute default');
+        authState.tokenExpiry = Date.now() + (5 * 60 * 1000); // 5 minutes default
+      }
+      
+      console.error(`[Auth] ✅ Admin login successful for: ${identifier}`);
+      return true;
+    }
+    
+    console.error(`[Auth] ❌ Login failed - no JWT in response`);
+    console.error(`[Auth] Response data:`, JSON.stringify(response.data));
+    return false;
+    
+  } catch (error) {
+    console.error(`[Auth] ❌ Login error:`, error);
+    if (axios.isAxiosError(error)) {
+      console.error(`[Auth] Status: ${error.response?.status}`);
+      console.error(`[Auth] Response data:`, error.response?.data);
+    }
+    return false;
+  }
+}
+
+/**
+ * Check if current token is valid
+ */
+function isTokenValid(): boolean {
+  if (!authState.token || !authState.isAuthenticated) {
+    return false;
+  }
+  
+  // Token expiry check
+  if (authState.tokenExpiry && Date.now() > authState.tokenExpiry) {
+    console.error('[Auth] Token expired');
+    return false;
+  }
+  
+  // 5 dakikalık timeout check
+  const fiveMinutes = 5 * 60 * 1000;
+  if (Date.now() - authState.lastAuthTime > fiveMinutes) {
+    console.error('[Auth] Token timeout (5 minutes)');
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Ensure authentication is valid, re-authenticate if needed
+ */
+async function ensureAuthenticated(): Promise<boolean> {
+  if (isTokenValid()) {
+    return true;
+  }
+  
+  console.error('[Auth] Re-authentication required');
+  authState.isAuthenticated = false;
+  authState.token = null;
+  adminJwtToken = null;
+  
+  // Re-authenticate if credentials are available
+  if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
+    return await authenticateAdmin(STRAPI_ADMIN_EMAIL, STRAPI_ADMIN_PASSWORD);
+  }
+  
+  return false;
+}
+
+/**
  * Log in to the Strapi admin API using provided credentials
  */
 async function loginToStrapiAdmin(): Promise<boolean> {
@@ -161,59 +1101,110 @@ async function loginToStrapiAdmin(): Promise<boolean> {
     return false;
   }
 
+  // Use the enhanced authenticateAdmin function instead of duplicating logic
+  return await authenticateAdmin(email, password);
+}
+
+/**
+ * Generic request function with enhanced authentication and v4 compatibility
+ */
+async function makeRequest(endpoint: string, options: any = {}): Promise<any> {
+  // Authentication check - skip for login endpoint
+  if (endpoint !== '/admin/login' && !await ensureAuthenticated()) {
+    throw new Error('Authentication required');
+  }
+  
+  // Build headers with compatibility using new buildHeaders function
+  const headers = buildHeaders(endpoint, options.headers);
+  
+  const requestOptions = {
+    method: options.method || 'GET',
+    headers,
+    ...options
+  };
+  
+  // Remove headers from options to avoid duplication
+  delete requestOptions.headers;
+  requestOptions.headers = headers;
+  
+  console.error(`[Request] ${requestOptions.method} ${endpoint}`);
+  console.error(`[Request] Headers:`, headers);
+  
   try {
-    // Log the authentication attempt with more detail
-    console.error(`[Auth] Attempting login to Strapi admin at ${STRAPI_URL}/admin/login as ${email}`);
-    console.error(`[Auth] Full URL being used: ${STRAPI_URL}/admin/login`);
-    
-    // Make the request with more detailed logging
-    console.error(`[Auth] Sending POST request with email and password`);
-    const response = await axios.post(`${STRAPI_URL}/admin/login`, { 
-      email, 
-      password 
+    const response = await axios({
+      method: requestOptions.method,
+      url: `${STRAPI_URL}${endpoint}`,
+      headers: requestOptions.headers,
+      data: requestOptions.data,
+      params: requestOptions.params
     });
     
-    console.error(`[Auth] Response status: ${response.status}`);
-    console.error(`[Auth] Response headers:`, JSON.stringify(response.headers));
+    if (response.status >= 200 && response.status < 300) {
+      // Response format validation
+      validateResponseFormat(response.data, endpoint);
+      
+      // Log request summary
+      logRequestSummary(endpoint, headers, response.data);
+      
+      return response.data;
+    } else {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
     
-    // Check if we got back valid data
-    if (response.data && response.data.data && response.data.data.token) {
-      adminJwtToken = response.data.data.token;
-      console.error("[Auth] Successfully logged in to Strapi admin");
-      console.error(`[Auth] Token received (first 20 chars): ${adminJwtToken?.substring(0, 20)}...`);
-      return true;
-    } else {
-      console.error("[Auth] Login response missing token");
-      console.error(`[Auth] Response data:`, JSON.stringify(response.data));
-      return false;
-    }
   } catch (error) {
-    console.error("[Auth] Failed to log in to Strapi admin:");
-    if (axios.isAxiosError(error)) {
-      console.error(`[Auth] Status: ${error.response?.status}`);
-      console.error(`[Auth] Response data:`, error.response?.data);
-      console.error(`[Auth] Request URL: ${error.config?.url}`);
-      console.error(`[Auth] Request method: ${error.config?.method}`);
-    } else {
-      console.error(error);
+    console.error(`[Request] Failed for ${endpoint}:`, error);
+    
+    // Handle 401 errors with re-authentication
+    if (axios.isAxiosError(error) && error.response?.status === 401 && endpoint !== '/admin/login') {
+      console.error("[Request] Authentication error detected. Attempting re-authentication...");
+      authState.isAuthenticated = false;
+      authState.token = null;
+      
+      // Try to re-authenticate
+      const reAuthSuccess = await ensureAuthenticated();
+      if (reAuthSuccess) {
+        console.error("[Request] Re-authentication successful. Retrying original request...");
+        
+        // Update headers with new token using buildHeaders
+        const retryHeaders = buildHeaders(endpoint, options.headers);
+        
+        try {
+          const retryResponse = await axios({
+            method: requestOptions.method,
+            url: `${STRAPI_URL}${endpoint}`,
+            headers: retryHeaders,
+            data: requestOptions.data,
+            params: requestOptions.params
+          });
+          
+          console.error(`[Request] Retry successful, status: ${retryResponse.status}`);
+          
+          // Response format validation for retry
+          validateResponseFormat(retryResponse.data, endpoint);
+          
+          // Log request summary for retry
+          logRequestSummary(endpoint, retryHeaders, retryResponse.data);
+          
+          return retryResponse.data;
+        } catch (retryError) {
+          console.error(`[Request] Retry failed:`, retryError);
+          throw retryError;
+        }
+      }
     }
-    return false;
+    
+    throw error;
   }
 }
 
 /**
- * Make a request to the admin API using the admin JWT token
+ * Make a request to the admin API with enhanced authentication and v4 compatibility
  */
-async function makeAdminApiRequest(endpoint: string, method: string = 'get', data?: any, params?: Record<string, any>): Promise<any> { // Add params
-  if (!adminJwtToken) {
-    // Try to log in first
-    console.error(`[Admin API] No token available, attempting login...`);
-    const success = await loginToStrapiAdmin();
-    if (!success) {
-      console.error(`[Admin API] Login failed. Cannot authenticate for admin API access.`);
-      throw new Error("Not authenticated for admin API access");
-    }
-    console.error(`[Admin API] Login successful, proceeding with request.`);
+async function makeAdminApiRequest(endpoint: string, method: string = 'get', data?: any, params?: Record<string, any>): Promise<any> {
+  // Ensure authentication before making request
+  if (!await ensureAuthenticated()) {
+    console.error(`[Admin API] Authentication failed. Cannot make request to ${endpoint}`);
+    throw new Error("Not authenticated for admin API access");
   }
   
   const fullUrl = `${STRAPI_URL}${endpoint}`;
@@ -223,15 +1214,17 @@ async function makeAdminApiRequest(endpoint: string, method: string = 'get', dat
     console.error(`[Admin API] Request payload: ${JSON.stringify(data, null, 2)}`);
   }
   
+  // Build headers with compatibility using new buildHeaders function
+  const headers = buildHeaders(endpoint, {});
+  
   try {
-    console.error(`[Admin API] Sending request with Authorization header using token: ${adminJwtToken?.substring(0, 20)}...`);
+    console.error(`[Admin API] Sending request with token: ${authState.token?.substring(0, 20)}...`);
+    console.error(`[Admin API] Headers:`, headers);
+    
     const response = await axios({
       method,
       url: fullUrl,
-      headers: {
-        'Authorization': `Bearer ${adminJwtToken}`,
-        'Content-Type': 'application/json'
-      },
+      headers,
       data, // Used for POST, PUT, etc.
       params // Used for GET requests query parameters
     });
@@ -239,7 +1232,14 @@ async function makeAdminApiRequest(endpoint: string, method: string = 'get', dat
     console.error(`[Admin API] Response status: ${response.status}`);
     if (response.data) {
       console.error(`[Admin API] Response received successfully`);
+      
+      // Response format validation
+      validateResponseFormat(response.data, endpoint);
+      
+      // Log request summary
+      logRequestSummary(endpoint, headers, response.data);
     }
+    
     return response.data;
   } catch (error) {
     console.error(`[Admin API] Request to ${endpoint} failed:`);
@@ -250,39 +1250,50 @@ async function makeAdminApiRequest(endpoint: string, method: string = 'get', dat
       console.error(`[Admin API] Error headers: ${JSON.stringify(error.response?.headers)}`);
       
       // Check if it's an auth error (e.g., token expired)
-      if (error.response?.status === 401 && adminJwtToken) {
-        console.error("[Admin API] Admin token might be expired. Attempting re-login...");
-        adminJwtToken = null; // Clear expired token
-        const loginSuccess = await loginToStrapiAdmin();
-        if (loginSuccess) {
-          console.error("[Admin API] Re-login successful. Retrying original request...");
-          // Retry the request once after successful re-login
+      if (error.response?.status === 401) {
+        console.error("[Admin API] Authentication error detected. Attempting re-authentication...");
+        authState.isAuthenticated = false;
+        authState.token = null;
+        adminJwtToken = null;
+        
+        // Try to re-authenticate
+        const reAuthSuccess = await ensureAuthenticated();
+        if (reAuthSuccess) {
+          console.error("[Admin API] Re-authentication successful. Retrying original request...");
+          // Retry the request once after successful re-authentication
           try {
+            // Build headers again with new token
+            const retryHeaders = buildHeaders(endpoint, {});
+            
             const retryResponse = await axios({
               method,
               url: fullUrl,
-              headers: {
-                'Authorization': `Bearer ${adminJwtToken}`,
-                'Content-Type': 'application/json'
-              },
+              headers: retryHeaders,
               data,
               params
             });
             console.error(`[Admin API] Retry successful, status: ${retryResponse.status}`);
+            
+            // Response format validation for retry
+            validateResponseFormat(retryResponse.data, endpoint);
+            
+            // Log request summary for retry
+            logRequestSummary(endpoint, retryHeaders, retryResponse.data);
+            
             return retryResponse.data;
           } catch (retryError) {
             console.error(`[Admin API] Retry failed:`, retryError);
             throw retryError;
           }
         } else {
-          console.error("[Admin API] Re-login failed. Throwing original error.");
+          console.error("[Admin API] Re-authentication failed. Throwing original error.");
           throw new Error("Admin re-authentication failed after token expiry.");
         }
       }
     } else {
       console.error(`[Admin API] Non-Axios error:`, error);
     }
-    // If not a 401 or re-login failed, throw the original error
+    // If not a 401 or re-authentication failed, throw the original error
     throw error;
   }
 }
@@ -567,7 +1578,9 @@ async function fetchEntries(contentType: string, queryParams?: QueryParams): Pro
             console.error(`[API] Returning data fetched via admin credentials for ${contentType}`);
             return { data: fetchedData, meta: fetchedMeta };
          } else {
-            console.error(`[API] Admin fetch succeeded for ${contentType} but returned no entries. Trying API token.`);
+            console.error(`[API] Admin fetch succeeded for ${contentType} but returned no entries. This is normal if the content type is empty.`);
+            // Don't try API token if admin succeeded but returned empty results
+            return { data: [], meta: fetchedMeta };
          }
       } else {
          console.error(`[API] Admin fetch for ${contentType} did not return expected 'results' array. Response:`, adminResponse);
@@ -633,7 +1646,7 @@ async function fetchEntries(contentType: string, queryParams?: QueryParams): Pro
       } catch (err: any) {
         if (axios.isAxiosError(err) && (err.response?.status === 404 || err.response?.status === 403 || err.response?.status === 401)) {
           // 404: Try next path. 403/401: Permissions issue
-          console.error(`[API] Path ${path} failed with ${err.response?.status}, trying next path...`);
+          console.error(`[API] Path ${path} returned an error:`, { status: err.response?.status, name: err.response?.data?.error?.name || 'Unknown', message: err.response?.data?.error?.message || err.message, details: err.response?.data?.error?.details || {} });
           continue;
         }
         // For other errors, rethrow to be caught by the outer try-catch
@@ -659,22 +1672,29 @@ async function fetchEntries(contentType: string, queryParams?: QueryParams): Pro
     console.error(`[API] Error during strapiClient fetch for ${contentType}:`, error);
   }
 
-  // --- All attempts failed: Provide helpful error instead of silent empty return ---
+  // --- If we reach here, provide informative message instead of throwing error ---
   console.error(`[API] All attempts failed to fetch entries for ${contentType}`);
   
-  let errorMessage = `Failed to fetch entries for content type ${contentType}. This could be due to:\n`;
-  errorMessage += "1. Content type doesn't exist in your Strapi instance\n";
-  errorMessage += "2. API token lacks permissions to access this content type\n";
-  errorMessage += "3. Admin credentials don't have access to this content type\n";
-  errorMessage += "4. Content type exists but has no published entries\n";
-  errorMessage += "5. Database connectivity issues\n\n";
-  errorMessage += "Troubleshooting:\n";
-  errorMessage += `- Verify ${contentType} exists in your Strapi admin panel\n`;
-  errorMessage += "- Check your API token permissions\n";
-  errorMessage += "- Ensure the content type has published entries\n";
-  errorMessage += "- Verify admin credentials if using admin authentication";
+  // Instead of throwing an error, return empty result with informative message
+  console.error(`[API] This could be because:`);
+  console.error(`[API] 1. Content type '${contentType}' has no published entries`);
+  console.error(`[API] 2. Content type API is not enabled in Strapi Settings > API Tokens > Roles`);
+  console.error(`[API] 3. API token lacks permissions to access this content type`);
+  console.error(`[API] 4. Content type exists only in admin but not exposed to public API`);
+  console.error(`[API] Returning empty result instead of error.`);
   
-  throw new ExtendedMcpError(ExtendedErrorCode.ResourceNotFound, errorMessage);
+  // Return empty result instead of throwing error
+  return { 
+    data: [], 
+    meta: { 
+      message: `No entries found for ${contentType}. This could be because the content type is empty, not published, or API access is not enabled.`,
+      troubleshooting: [
+        `Check if ${contentType} has published entries in Strapi admin panel`,
+        "Verify API permissions in Settings > API Tokens > Roles",
+        "Ensure content type API is enabled in Settings > API Tokens > Roles"
+      ]
+    } 
+  };
 }
 
 /**
@@ -692,7 +1712,8 @@ async function fetchEntry(contentType: string, id: string, queryParams?: QueryPa
       console.error(`[API] Attempt 1: Fetching entry ${id} for ${contentType} using admin credentials`);
       try {
         // Admin API for content management uses a different path structure
-        const adminEndpoint = `/content-manager/collection-types/${contentType}/${id}`;
+        // Build endpoint with correct ID parameter
+        const adminEndpoint = IdParameterHandler.buildEndpoint(`/content-manager/collection-types/${contentType}`, id, contentType);
         
         // Prepare admin params
         const adminParams: Record<string, any> = {};
@@ -725,12 +1746,22 @@ async function fetchEntry(contentType: string, id: string, queryParams?: QueryPa
     }
 
     console.error(`[API] Attempt 2: Fetching entry ${id} for ${contentType} using API token`);
+    
+    // Build endpoint with correct ID parameter
+    const endpoint = IdParameterHandler.buildEndpoint(`/api/${collection}`, id, contentType);
+    
     // Get the entry from Strapi
-    const response = await strapiClient.get(`/api/${collection}/${id}`, { params });
+    const response = await strapiClient.get(endpoint, { params });
     
     return response.data.data;
   } catch (error: any) {
     console.error(`[Error] Failed to fetch entry ${id} for ${contentType}:`, error);
+    
+    // Handle ID-related errors
+    const handledError = IdErrorHandler.handleIdError(error, id, contentType);
+    if (handledError !== error) {
+      throw handledError;
+    }
     
     let errorMessage = `Failed to fetch entry ${id} for ${contentType}`;
     let errorCode = ExtendedErrorCode.InternalError;
@@ -763,6 +1794,89 @@ async function fetchEntry(contentType: string, id: string, queryParams?: QueryPa
 async function createEntry(contentType: string, data: any): Promise<any> {
   try {
     console.error(`[API] Creating new entry for content type: ${contentType}`);
+    
+    // STEP 1: Validate content type schema before creating entry
+    console.error(`[API] Validating schema for content type: ${contentType}`);
+    let contentTypeSchema;
+    try {
+      contentTypeSchema = await fetchContentTypeSchema(contentType);
+      console.error(`[API] Schema validation successful for ${contentType}`);
+    } catch (schemaError) {
+      console.error(`[API] Failed to fetch schema for ${contentType}:`, schemaError);
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Content type ${contentType} does not exist or schema is not accessible. Please check the content type name.`
+      );
+    }
+
+    // STEP 2: Validate required fields based on schema
+    if (contentTypeSchema?.schema?.attributes) {
+      const requiredFields = Object.entries(contentTypeSchema.schema.attributes)
+        .filter(([_, attr]: [string, any]) => attr.required === true)
+        .map(([fieldName, _]) => fieldName);
+
+      const missingFields = requiredFields.filter(field => 
+        data[field] === undefined || data[field] === null || data[field] === ''
+      );
+
+      if (missingFields.length > 0) {
+        console.error(`[API] Missing required fields for ${contentType}:`, missingFields);
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Missing required fields for ${contentType}: ${missingFields.join(', ')}. Required fields: ${requiredFields.join(', ')}`
+        );
+      }
+
+      console.error(`[API] Required field validation passed for ${contentType}`);
+    }
+
+    // STEP 3: Validate field types and constraints
+    if (contentTypeSchema?.schema?.attributes) {
+      const validationErrors = [];
+      
+      for (const [fieldName, fieldValue] of Object.entries(data)) {
+        const fieldSchema = contentTypeSchema.schema.attributes[fieldName];
+        
+        if (!fieldSchema) {
+          validationErrors.push(`Field '${fieldName}' does not exist in schema`);
+          continue;
+        }
+
+        // Check string max length
+        if (fieldSchema.type === 'string' && fieldSchema.maxLength && typeof fieldValue === 'string') {
+          if (fieldValue.length > fieldSchema.maxLength) {
+            validationErrors.push(`Field '${fieldName}' exceeds maximum length of ${fieldSchema.maxLength} characters`);
+          }
+        }
+
+        // Check text max length
+        if (fieldSchema.type === 'text' && fieldSchema.maxLength && typeof fieldValue === 'string') {
+          if (fieldValue.length > fieldSchema.maxLength) {
+            validationErrors.push(`Field '${fieldName}' exceeds maximum length of ${fieldSchema.maxLength} characters`);
+          }
+        }
+
+        // Check number constraints
+        if (fieldSchema.type === 'number' && typeof fieldValue === 'number') {
+          if (fieldSchema.min !== undefined && fieldValue < fieldSchema.min) {
+            validationErrors.push(`Field '${fieldName}' is below minimum value of ${fieldSchema.min}`);
+          }
+          if (fieldSchema.max !== undefined && fieldValue > fieldSchema.max) {
+            validationErrors.push(`Field '${fieldName}' is above maximum value of ${fieldSchema.max}`);
+          }
+        }
+      }
+
+      if (validationErrors.length > 0) {
+        console.error(`[API] Field validation errors for ${contentType}:`, validationErrors);
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Field validation failed for ${contentType}: ${validationErrors.join('; ')}`
+        );
+      }
+
+      console.error(`[API] Field validation passed for ${contentType}`);
+    }
     
     // Extract the collection name from the content type UID
     const collection = contentType.split(".")[1];
@@ -825,6 +1939,12 @@ async function createEntry(contentType: string, data: any): Promise<any> {
     }
   } catch (error) {
     console.error(`[Error] Failed to create entry for ${contentType}:`, error);
+    
+    // Re-throw McpError as is
+    if (error instanceof McpError) {
+      throw error;
+    }
+    
     throw new McpError(
       ErrorCode.InternalError,
       `Failed to create entry for ${contentType}: ${error instanceof Error ? error.message : String(error)}`
@@ -836,44 +1956,111 @@ async function createEntry(contentType: string, data: any): Promise<any> {
  * Update an existing entry
  */
 async function updateEntry(contentType: string, id: string, data: any): Promise<any> {
-  const collection = contentType.split(".")[1];
-  const apiPath = `/api/${collection}/${id}`;
-  let responseData: any = null;
-
-  // --- Attempt 1: Use Admin Credentials via makeAdminApiRequest ---
-  if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
-    console.error(`[API] Attempt 1: Updating entry ${id} for ${contentType} using makeAdminApiRequest`);
-    try {
-      // Admin API for content management often uses a different path structure
-      const adminEndpoint = `/content-manager/collection-types/${contentType}/${id}`;
-      console.error(`[API] Trying admin update endpoint: ${adminEndpoint}`);
-      
-      // Admin API PUT might just need the data directly, not nested under 'data'
-      const adminResponse = await makeAdminApiRequest(adminEndpoint, 'put', data); // Send 'data' directly
-
-      // Check response from admin API (structure might differ)
-      if (adminResponse) {
-        console.error(`[API] Successfully updated entry ${id} via makeAdminApiRequest.`);
-        // Admin API might return the updated entry directly or nested under 'data'
-        return adminResponse.data || adminResponse; 
-      } else {
-        // Should not happen if makeAdminApiRequest resolves, but handle defensively
-        console.warn(`[API] Admin update for ${id} completed but returned no data.`);
-        // Return a success indicator even without data, as the operation likely succeeded
-        return { id: id, message: "Update via admin succeeded, no data returned." }; 
-      }
-    } catch (adminError) {
-      console.error(`[API] Failed to update entry ${id} using admin credentials:`, adminError);
-      console.error(`[API] Admin credentials failed, attempting to use API token as fallback.`);
-    }
-  } else {
-    console.error("[API] Admin credentials not provided, falling back to API token.");
-  }
-
-  // --- Attempt 2: Use API Token via strapiClient (as fallback) ---
-  console.error(`[API] Attempt 2: Updating entry ${id} for ${contentType} using strapiClient`);
   try {
-    const response = await strapiClient.put(apiPath, { data: data });
+    console.error(`[API] Updating entry ${id} for content type: ${contentType}`);
+    
+    // STEP 1: Validate content type schema before updating entry
+    console.error(`[API] Validating schema for content type: ${contentType}`);
+    let contentTypeSchema;
+    try {
+      contentTypeSchema = await fetchContentTypeSchema(contentType);
+      console.error(`[API] Schema validation successful for ${contentType}`);
+    } catch (schemaError) {
+      console.error(`[API] Failed to fetch schema for ${contentType}:`, schemaError);
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Content type ${contentType} does not exist or schema is not accessible. Please check the content type name.`
+      );
+    }
+
+    // STEP 2: Validate field types and constraints (for update, required fields are not mandatory)
+    if (contentTypeSchema?.schema?.attributes) {
+      const validationErrors = [];
+      
+      for (const [fieldName, fieldValue] of Object.entries(data)) {
+        const fieldSchema = contentTypeSchema.schema.attributes[fieldName];
+        
+        if (!fieldSchema) {
+          validationErrors.push(`Field '${fieldName}' does not exist in schema`);
+          continue;
+        }
+
+        // Check string max length
+        if (fieldSchema.type === 'string' && fieldSchema.maxLength && typeof fieldValue === 'string') {
+          if (fieldValue.length > fieldSchema.maxLength) {
+            validationErrors.push(`Field '${fieldName}' exceeds maximum length of ${fieldSchema.maxLength} characters`);
+          }
+        }
+
+        // Check text max length
+        if (fieldSchema.type === 'text' && fieldSchema.maxLength && typeof fieldValue === 'string') {
+          if (fieldValue.length > fieldSchema.maxLength) {
+            validationErrors.push(`Field '${fieldName}' exceeds maximum length of ${fieldSchema.maxLength} characters`);
+          }
+        }
+
+        // Check number constraints
+        if (fieldSchema.type === 'number' && typeof fieldValue === 'number') {
+          if (fieldSchema.min !== undefined && fieldValue < fieldSchema.min) {
+            validationErrors.push(`Field '${fieldName}' is below minimum value of ${fieldSchema.min}`);
+          }
+          if (fieldSchema.max !== undefined && fieldValue > fieldSchema.max) {
+            validationErrors.push(`Field '${fieldName}' is above maximum value of ${fieldSchema.max}`);
+          }
+        }
+      }
+
+      if (validationErrors.length > 0) {
+        console.error(`[API] Field validation errors for ${contentType}:`, validationErrors);
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Field validation failed for ${contentType}: ${validationErrors.join('; ')}`
+        );
+      }
+
+      console.error(`[API] Field validation passed for ${contentType}`);
+    }
+    
+    const collection = contentType.split(".")[1];
+
+    // --- Attempt 1: Use Admin Credentials via makeAdminApiRequest ---
+    if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
+      console.error(`[API] Attempt 1: Updating entry ${id} for ${contentType} using makeAdminApiRequest`);
+      try {
+        // Admin API for content management often uses a different path structure
+        // Build endpoint with correct ID parameter
+        const adminEndpoint = IdParameterHandler.buildEndpoint(`/content-manager/collection-types/${contentType}`, id, contentType);
+        console.error(`[API] Trying admin update endpoint: ${adminEndpoint}`);
+        
+        // Admin API PUT might just need the data directly, not nested under 'data'
+        const adminResponse = await makeAdminApiRequest(adminEndpoint, 'put', data); // Send 'data' directly
+
+        // Check response from admin API (structure might differ)
+        if (adminResponse) {
+          console.error(`[API] Successfully updated entry ${id} via makeAdminApiRequest.`);
+          // Admin API might return the updated entry directly or nested under 'data'
+          return adminResponse.data || adminResponse; 
+        } else {
+          // Should not happen if makeAdminApiRequest resolves, but handle defensively
+          console.warn(`[API] Admin update for ${id} completed but returned no data.`);
+          // Return a success indicator even without data, as the operation likely succeeded
+          return { id: id, message: "Update via admin succeeded, no data returned." }; 
+        }
+      } catch (adminError) {
+        console.error(`[API] Failed to update entry ${id} using admin credentials:`, adminError);
+        console.error(`[API] Admin credentials failed, attempting to use API token as fallback.`);
+      }
+    } else {
+      console.error("[API] Admin credentials not provided, falling back to API token.");
+    }
+
+    // --- Attempt 2: Use API Token via strapiClient (as fallback) ---
+    console.error(`[API] Attempt 2: Updating entry ${id} for ${contentType} using strapiClient`);
+    
+    // Build endpoint with correct ID parameter
+    const apiEndpoint = IdParameterHandler.buildEndpoint(`/api/${collection}`, id, contentType);
+    
+    const response = await strapiClient.put(apiEndpoint, { data: data });
     
     // Check if data was returned
     if (response.data && response.data.data) {
@@ -887,9 +2074,21 @@ async function updateEntry(contentType: string, id: string, data: any): Promise<
     }
   } catch (error) {
     console.error(`[API] Failed to update entry ${id} via strapiClient:`, error);
+    
+    // Re-throw McpError as is
+    if (error instanceof McpError) {
+      throw error;
+    }
+    
+    // Handle ID-related errors
+    const handledError = IdErrorHandler.handleIdError(error, id, contentType);
+    if (handledError !== error) {
+      throw handledError;
+    }
+    
     throw new McpError(
       ErrorCode.InternalError,
-      `Failed to update entry ${id} for ${contentType} via strapiClient: ${error instanceof Error ? error.message : String(error)}`
+      `Failed to update entry ${id} for ${contentType}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
 }
@@ -904,10 +2103,52 @@ async function deleteEntry(contentType: string, id: string): Promise<void> {
     // Extract the collection name from the content type UID
     const collection = contentType.split(".")[1];
     
-    // Delete the entry from Strapi
-    await strapiClient.delete(`/api/${collection}/${id}`);
+    // --- Attempt 1: Use Admin Credentials if available ---
+    if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
+      console.error(`[API] Attempting to delete entry ${id} using admin credentials`);
+      try {
+        // Strapi v5 admin API endpoint for deleting entries - use IdParameterHandler
+        const adminEndpoint = IdParameterHandler.buildEndpoint(`/content-manager/collection-types/${contentType}`, id, contentType);
+        console.error(`[API] Admin endpoint: ${adminEndpoint}`);
+        
+        const response = await makeAdminApiRequest(adminEndpoint, 'DELETE');
+        console.error(`[API] ✓ Successfully deleted entry ${id} via Admin API`);
+        return;
+      } catch (adminError) {
+        console.error(`[API] Admin API delete failed:`, adminError);
+        // Continue to try Content API
+      }
+    }
+    
+    // --- Attempt 2: Use Content API with API Token ---
+    if (STRAPI_API_TOKEN) {
+      console.error(`[API] Attempting to delete entry ${id} using API token`);
+      try {
+        // Build endpoint with correct ID parameter
+        const endpoint = IdParameterHandler.buildEndpoint(`/api/${collection}`, id, contentType);
+        console.error(`[API] Content API endpoint: ${endpoint}`);
+        
+        // Delete the entry from Strapi
+        await strapiClient.delete(endpoint);
+        console.error(`[API] ✓ Successfully deleted entry ${id} via Content API`);
+        return;
+      } catch (tokenError) {
+        console.error(`[API] Content API delete failed:`, tokenError);
+        throw tokenError;
+      }
+    }
+    
+    throw new Error('No valid authentication method available for deleting entries');
+    
   } catch (error) {
     console.error(`[Error] Failed to delete entry ${id} for ${contentType}:`, error);
+    
+    // Handle ID-related errors
+    const handledError = IdErrorHandler.handleIdError(error, id, contentType);
+    if (handledError !== error) {
+      throw handledError;
+    }
+    
     throw new McpError(
       ErrorCode.InternalError,
       `Failed to delete entry ${id} for ${contentType}: ${error instanceof Error ? error.message : String(error)}`
@@ -941,18 +2182,27 @@ async function uploadMedia(fileData: string, fileName: string, fileType: string)
       console.error(`[API] Warning: Large file detected (~${estimatedFileSizeMB}MB). This may cause context window issues.`);
     }
     
+    // Strapi v5: Direct buffer upload to /api/upload endpoint
+    console.error(`[API] Converting base64 to buffer for direct upload`);
+    
     const buffer = Buffer.from(fileData, 'base64');
     
-    // Use FormData for file upload
-    const formData = new FormData();
-    // Convert Buffer to Blob with the correct content type
-    const blob = new Blob([buffer], { type: fileType });
-    formData.append('files', blob, fileName);
-
-    const response = await strapiClient.post('/api/upload', formData, {
+    // Use form-data for multipart/form-data request (same as uploadMediaFromPath)
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    
+    // Append buffer directly with proper options
+    form.append('files', buffer, {
+      filename: fileName,
+      contentType: fileType
+    });
+    
+    console.error(`[API] Uploading to /api/upload endpoint (Strapi v5)`);
+    
+    // Make request directly to upload endpoint (no authentication needed for file upload)
+    const response = await strapiClient.post('/api/upload', form, {
       headers: {
-        // Let axios set the correct multipart/form-data content-type with boundary
-        'Content-Type': 'multipart/form-data'
+        ...form.getHeaders(), // Get proper multipart headers
       }
     });
     
@@ -970,9 +2220,103 @@ async function uploadMedia(fileData: string, fileName: string, fileType: string)
 }
 
 /**
- * Upload media file from file path (alternative to base64)
+ * Find folder by name in Strapi Media Library
  */
-async function uploadMediaFromPath(filePath: string, fileName?: string, fileType?: string): Promise<any> {
+async function findFolder(folderName: string): Promise<any | null> {
+  try {
+    console.error(`[API] Searching for folder: ${folderName}`);
+    
+    // Ensure we have authenticated if required
+    if (!await ensureAuthenticated()) {
+      throw new Error('Authentication required');
+    }
+    
+    // Make request to get folders
+    const response = await makeRequest('/upload/folders', {
+      method: 'GET',
+      params: {
+        'filters[name][$eq]': folderName,
+        'pagination[limit]': 1
+      }
+    });
+    
+    if (response.data && Array.isArray(response.data) && response.data.length > 0) {
+      console.error(`[API] Found existing folder: ${folderName} (ID: ${response.data[0].id})`);
+      return response.data[0];
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`[API] Error searching for folder ${folderName}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Create a new folder in Strapi Media Library
+ */
+async function createFolder(folderName: string, parentId: number | null = null): Promise<any> {
+  try {
+    console.error(`[API] Creating folder: ${folderName}`);
+    
+    // Ensure we have authenticated if required
+    if (!await ensureAuthenticated()) {
+      throw new Error('Authentication required');
+    }
+    
+    // Prepare folder data
+    const folderData = {
+      name: folderName,
+      parent: parentId
+    };
+    
+    console.error(`[API] Folder data:`, folderData);
+    
+    // Create folder via admin API
+    const response = await makeRequest('/upload/folders/', {
+      method: 'POST',
+      data: folderData
+    });
+    
+    if (response.data) {
+      console.error(`[API] Successfully created folder: ${folderName} (ID: ${response.data.id})`);
+      return response.data;
+    } else {
+      throw new Error('Failed to create folder - no data returned');
+    }
+  } catch (error) {
+    console.error(`[API] Error creating folder ${folderName}:`, error);
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Failed to create folder ${folderName}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+/**
+ * Get folder ID by name (create if doesn't exist)
+ */
+async function getFolderId(folderName: string): Promise<number | null> {
+  try {
+    // First try to find existing folder
+    let folder = await findFolder(folderName);
+    
+    if (!folder) {
+      console.error(`[API] Folder '${folderName}' not found, creating new folder`);
+      folder = await createFolder(folderName);
+    }
+    
+    return folder?.id || null;
+  } catch (error) {
+    console.error(`[API] Error getting folder ID for ${folderName}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Upload media file from file path (alternative to base64) with folder support
+ */
+async function uploadMediaFromPath(filePath: string, fileName?: string, fileType?: string, folderName?: string): Promise<any> {
   try {
     const fs = await import('fs');
     const path = await import('path');
@@ -1017,12 +2361,91 @@ async function uploadMediaFromPath(filePath: string, fileName?: string, fileType
       actualFileType = mimeTypes[extension] || 'application/octet-stream';
     }
     
-    // Read file and convert to base64
-    const fileBuffer = fs.readFileSync(filePath);
-    const base64Data = fileBuffer.toString('base64');
+    // Handle folder logic if folderName is provided
+    let folderId: number | null = null;
+    if (folderName) {
+      console.error(`[API] Processing folder: ${folderName}`);
+      try {
+        folderId = await getFolderId(folderName);
+        console.error(`[API] Using folder ID: ${folderId}`);
+      } catch (folderError) {
+        console.error(`[API] Warning: Failed to create/find folder ${folderName}:`, folderError);
+        console.error(`[API] Continuing with upload to root folder...`);
+      }
+    }
     
-    // Use the existing uploadMedia function
-    return await uploadMedia(base64Data, actualFileName, actualFileType);
+    // Strapi v5: Direct file upload to /upload endpoint with folder support
+    console.error(`[API] Reading file buffer for direct upload: ${filePath}`);
+    
+    // Read file as buffer (no base64 conversion needed)
+    const fileBuffer = fs.readFileSync(filePath);
+    
+    // Use form-data for multipart/form-data request
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    
+    // Append file buffer directly with proper options
+    form.append('files', fileBuffer, {
+      filename: actualFileName,
+      contentType: actualFileType
+    });
+    
+    // Add file info with folder metadata (Strapi v5 format)
+    const fileInfo: any = {
+      name: actualFileName,
+      caption: '',
+      alternativeText: ''
+    };
+    
+    // Add folder ID if available - try multiple approaches for compatibility
+    if (folderId) {
+      // Method 1: Add folder to fileInfo (recommended for Strapi v5)
+      fileInfo.folder = folderId;
+      
+      // Method 2: Direct form parameters (fallback)
+      form.append('folder', folderId.toString());
+      form.append('folderId', folderId.toString());
+      
+      console.error(`[API] Adding folder ID to upload: ${folderId} (using fileInfo.folder + form parameters)`);
+    }
+    
+    // Add fileInfo as JSON string
+    form.append('fileInfo', JSON.stringify(fileInfo));
+    console.error(`[API] FileInfo metadata:`, JSON.stringify(fileInfo, null, 2));
+    
+    console.error(`[API] Uploading to /upload endpoint (Strapi v5) ${folderId ? `with folder ID ${folderId}` : 'to root folder'}`);
+    console.error(`[API] Form data fields:`, Object.keys(form.getHeaders()));
+    
+    // Ensure we have authentication for file upload
+    if (!await ensureAuthenticated()) {
+      throw new Error('Authentication required for file upload');
+    }
+    
+    // Make request to upload endpoint using makeRequest for proper authentication
+    const response = await makeRequest('/upload', {
+      method: 'POST',
+      data: form,
+      headers: {
+        ...form.getHeaders(), // Get proper multipart headers
+      }
+    });
+    
+    console.error(`[API] ✅ File upload successful`);
+    console.error(`[API] Upload response:`, JSON.stringify(response, null, 2));
+    
+    // Check if files were uploaded to the correct folder
+    if (response && Array.isArray(response) && response.length > 0) {
+      const uploadedFile = response[0];
+      if (uploadedFile.folder || uploadedFile.folderId) {
+        console.error(`[API] ✅ File uploaded to folder:`, uploadedFile.folder || uploadedFile.folderId);
+      } else if (folderId) {
+        console.error(`[API] ⚠️ Warning: Folder ID was specified (${folderId}) but uploaded file doesn't show folder info`);
+      }
+    }
+    
+    // Filter out any base64 data from the response to prevent context overflow
+    const cleanResponse = filterBase64FromResponse(response);
+    return cleanResponse;
     
   } catch (error) {
     console.error(`[Error] Failed to upload media file from path ${filePath}:`, error);
@@ -1246,10 +2669,17 @@ function filterBase64FromResponse(data: any): any {
 async function connectRelation(contentType: string, id: string, relationField: string, relatedIds: number[] | string[]): Promise<any> {
   try {
     console.error(`[API] Connecting relations for ${contentType} ${id}, field ${relationField}`);
+    
+    // Transform related IDs based on version
+    const transformedRelatedIds = relatedIds.map(relatedId => {
+      const { value } = IdParameterHandler.resolveIdParameter(relatedId.toString(), relationField);
+      return { id: Number(value) }; // For v4 compatibility, ensure IDs are numbers
+    });
+    
     const updateData = {
       data: { // Strapi v4 expects relation updates within the 'data' object for PUT
         [relationField]: {
-          connect: relatedIds.map(rid => ({ id: Number(rid) })) // Ensure IDs are numbers
+          connect: transformedRelatedIds
         }
       }
     };
@@ -1272,10 +2702,17 @@ async function connectRelation(contentType: string, id: string, relationField: s
 async function disconnectRelation(contentType: string, id: string, relationField: string, relatedIds: number[] | string[]): Promise<any> {
   try {
     console.error(`[API] Disconnecting relations for ${contentType} ${id}, field ${relationField}`);
-     const updateData = {
+    
+    // Transform related IDs based on version
+    const transformedRelatedIds = relatedIds.map(relatedId => {
+      const { value } = IdParameterHandler.resolveIdParameter(relatedId.toString(), relationField);
+      return { id: Number(value) }; // For v4 compatibility, ensure IDs are numbers
+    });
+    
+    const updateData = {
       data: { // Strapi v4 expects relation updates within the 'data' object for PUT
         [relationField]: {
-          disconnect: relatedIds.map(rid => ({ id: Number(rid) })) // Ensure IDs are numbers
+          disconnect: transformedRelatedIds
         }
       }
     };
@@ -1503,22 +2940,47 @@ async function disconnectRelation(contentType: string, id: string, relationField
    try {
      console.error(`[API] Publishing entry ${id} for content type: ${contentType}`);
      
+     // Resolve real documentId if integer ID is provided
+     let resolvedId = id;
+     if (detectedStrapiVersion === 'v5' && /^\d+$/.test(id)) {
+       console.error(`[API] Integer ID detected for v5, resolving to documentId...`);
+       try {
+         const collection = contentType.split(".")[1];
+         const response = await strapiClient.get(`/api/${collection}`, {
+           params: {
+             'filters[id][$eq]': id,
+             'pagination[limit]': 1
+           }
+         });
+         
+         if (response.data?.data?.[0]?.documentId) {
+           resolvedId = response.data.data[0].documentId;
+           console.error(`[API] Resolved ID ${id} to documentId: ${resolvedId}`);
+         } else {
+           console.error(`[API] Could not resolve ID ${id} to documentId, using original ID`);
+         }
+       } catch (resolveError) {
+         console.error(`[API] Failed to resolve ID ${id} to documentId:`, resolveError);
+         // Continue with original ID
+       }
+     }
+     
      // --- Attempt 1: Use Admin Credentials ---
      if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
-       console.error(`[API] Attempt 1: Publishing entry ${id} for ${contentType} using admin credentials`);
+       console.error(`[API] Attempt 1: Publishing entry ${resolvedId} for ${contentType} using admin credentials`);
        try {
-         // The admin API endpoint for publishing
-         const adminEndpoint = `/content-manager/collection-types/${contentType}/${id}/actions/publish`;
+         // The admin API endpoint for publishing - build with correct ID parameter
+         const adminEndpoint = IdParameterHandler.buildEndpoint(`/content-manager/collection-types/${contentType}`, resolvedId, contentType) + '/actions/publish';
          
          // Make the POST request to publish
          const adminResponse = await makeAdminApiRequest(adminEndpoint, 'post');
          
          if (adminResponse) {
-           console.error(`[API] Successfully published entry ${id} via admin credentials`);
+           console.error(`[API] Successfully published entry ${resolvedId} via admin credentials`);
            return adminResponse;
          }
        } catch (adminError) {
-         console.error(`[API] Failed to publish entry ${id} using admin credentials:`, adminError);
+         console.error(`[API] Failed to publish entry ${resolvedId} using admin credentials:`, adminError);
          console.error(`[API] Falling back to API token...`);
        }
      } else {
@@ -1527,11 +2989,14 @@ async function disconnectRelation(contentType: string, id: string, relationField
      
      // --- Attempt 2: Use API Token (fallback) - update the publishedAt field directly ---
      const collection = contentType.split(".")[1];
-     console.error(`[API] Attempt 2: Publishing entry ${id} for ${contentType} using API token`);
+     console.error(`[API] Attempt 2: Publishing entry ${resolvedId} for ${contentType} using API token`);
+     
+     // Build endpoint with correct ID parameter
+     const apiEndpoint = IdParameterHandler.buildEndpoint(`/api/${collection}`, resolvedId, contentType);
      
      // For API token, we'll update the publishedAt field to the current time
      const now = new Date().toISOString();
-     const response = await strapiClient.put(`/api/${collection}/${id}`, {
+     const response = await strapiClient.put(apiEndpoint, {
        data: {
          publishedAt: now
        }
@@ -1540,6 +3005,13 @@ async function disconnectRelation(contentType: string, id: string, relationField
      return response.data.data;
    } catch (error) {
      console.error(`[Error] Failed to publish entry ${id} for ${contentType}:`, error);
+     
+     // Handle ID-related errors
+     const handledError = IdErrorHandler.handleIdError(error, id, contentType);
+     if (handledError !== error) {
+       throw handledError;
+     }
+     
      throw new McpError(
        ErrorCode.InternalError,
        `Failed to publish entry ${id} for ${contentType}: ${error instanceof Error ? error.message : String(error)}`
@@ -1558,8 +3030,8 @@ async function disconnectRelation(contentType: string, id: string, relationField
      if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
        console.error(`[API] Attempt 1: Unpublishing entry ${id} for ${contentType} using admin credentials`);
        try {
-         // The admin API endpoint for unpublishing
-         const adminEndpoint = `/content-manager/collection-types/${contentType}/${id}/actions/unpublish`;
+         // The admin API endpoint for unpublishing - build with correct ID parameter
+         const adminEndpoint = IdParameterHandler.buildEndpoint(`/content-manager/collection-types/${contentType}`, id, contentType) + '/actions/unpublish';
          
          // Make the POST request to unpublish
          const adminResponse = await makeAdminApiRequest(adminEndpoint, 'post');
@@ -1580,8 +3052,11 @@ async function disconnectRelation(contentType: string, id: string, relationField
      const collection = contentType.split(".")[1];
      console.error(`[API] Attempt 2: Unpublishing entry ${id} for ${contentType} using API token`);
      
+     // Build endpoint with correct ID parameter
+     const apiEndpoint = IdParameterHandler.buildEndpoint(`/api/${collection}`, id, contentType);
+     
      // For API token, we'll set the publishedAt field to null
-     const response = await strapiClient.put(`/api/${collection}/${id}`, {
+     const response = await strapiClient.put(apiEndpoint, {
        data: {
          publishedAt: null
        }
@@ -1590,6 +3065,13 @@ async function disconnectRelation(contentType: string, id: string, relationField
      return response.data.data;
    } catch (error) {
      console.error(`[Error] Failed to unpublish entry ${id} for ${contentType}:`, error);
+     
+     // Handle ID-related errors
+     const handledError = IdErrorHandler.handleIdError(error, id, contentType);
+     if (handledError !== error) {
+       throw handledError;
+     }
+     
      throw new McpError(
        ErrorCode.InternalError,
        `Failed to unpublish entry ${id} for ${contentType}: ${error instanceof Error ? error.message : String(error)}`
@@ -1684,11 +3166,11 @@ async function disconnectRelation(contentType: string, id: string, relationField
  }
 
  /**
-  * Create a new component
+  * Create a new component - Enhanced for Strapi v5
   */
  async function createComponent(componentData: any): Promise<any> {
    try {
-     console.error(`[API] Creating new component`);
+     console.error(`[API] Creating new component (Strapi v5 enhanced)`);
      
      // Admin credentials are required for component operations
      if (!STRAPI_ADMIN_EMAIL || !STRAPI_ADMIN_PASSWORD) {
@@ -1698,39 +3180,112 @@ async function disconnectRelation(contentType: string, id: string, relationField
        );
      }
      
-     const { displayName, category, icon, attributes } = componentData;
+     // Ensure we have authenticated before making request
+     if (!await ensureAuthenticated()) {
+       throw new Error('Authentication required for component creation');
+     }
+     
+     const { displayName, category, icon, attributes, uid, apiId } = componentData;
      
      if (!displayName || !category || !attributes) {
        throw new Error("Missing required fields: displayName, category, attributes");
      }
      
-     // Convert displayName to API-friendly string (lowercase, hyphens)
-     const apiName = displayName.toLowerCase().replace(/\s+/g, '-');
-     
-     // Construct the payload for the API
+     // Strapi v5 için doğru payload yapısı - create-component-script.js'deki gibi
      const payload = {
        component: {
          category: category,
-         icon: icon || 'brush',
          displayName: displayName,
+         icon: icon || 'brush',
          attributes: attributes
        }
      };
      
-     console.error(`[API] Component creation payload:`, payload);
+     console.error(`[API] Component creation payload (v5):`, JSON.stringify(payload, null, 2));
      
-     // The admin API endpoint for creating components
+     // Strapi v5 için doğru endpoint: /content-type-builder/components
      const adminEndpoint = `/content-type-builder/components`;
+     console.error(`[API] Using admin endpoint: ${adminEndpoint}`);
      
-     // Make the POST request to create the component
-     const response = await makeAdminApiRequest(adminEndpoint, 'post', payload);
+     // Make the POST request to create the component with enhanced error handling
+     try {
+       const response = await makeAdminApiRequest(adminEndpoint, 'post', payload);
+       
+       console.error(`[API] ✅ Component created successfully!`);
+       console.error(`[API] Response:`, response);
+       
+       // Response data processing
+       if (response && response.data) {
+         console.error(`[API] Created component:`, {
+           uid: response.data.uid,
+           category: response.data.category,
+           displayName: response.data.displayName || response.data.schema?.displayName
+         });
+         return response.data;
+       } else if (response) {
+         // Response without nested data
+         console.error(`[API] Created component (direct response):`, response);
+         return response;
+       } else {
+         // Success but no response data
+         console.error(`[API] Component creation completed successfully`);
+         return { 
+           message: "Component creation successful", 
+           category: category,
+           displayName: displayName 
+         };
+       }
+       
+     } catch (adminError) {
+       console.error(`[API] ❌ Failed to create component:`, adminError);
+       
+       // Enhanced error reporting
+       if (axios.isAxiosError(adminError)) {
+         console.error(`[API] Status: ${adminError.response?.status}`);
+         console.error(`[API] Response data:`, adminError.response?.data);
+         
+         // Specific error handling for component creation
+         if (adminError.response?.status === 400) {
+           const errorData = adminError.response.data;
+           let errorMessage = `Invalid component data: ${adminError.response.statusText}`;
+           
+           if (errorData.error && errorData.error.message) {
+             errorMessage += ` - ${errorData.error.message}`;
+           }
+           
+           if (errorData.error && errorData.error.details) {
+             errorMessage += ` - Details: ${JSON.stringify(errorData.error.details)}`;
+           }
+           
+           throw new ExtendedMcpError(
+             ExtendedErrorCode.InvalidParams,
+             errorMessage
+           );
+         } else if (adminError.response?.status === 409) {
+           throw new ExtendedMcpError(
+             ExtendedErrorCode.InvalidParams,
+             `Component already exists or conflicts with existing component`
+           );
+         } else if (adminError.response?.status === 401 || adminError.response?.status === 403) {
+           throw new ExtendedMcpError(
+             ExtendedErrorCode.AccessDenied,
+             `Permission denied - Admin credentials might lack permissions for component creation`
+           );
+         }
+       }
+       
+       throw adminError;
+     }
      
-     console.error(`[API] Component creation response:`, response);
-     
-     // Strapi might restart after schema changes
-     return response?.data || { message: "Component creation initiated. Strapi might be restarting." };
    } catch (error) {
      console.error(`[Error] Failed to create component:`, error);
+     
+     // Re-throw ExtendedMcpError as is
+     if (error instanceof ExtendedMcpError) {
+       throw error;
+     }
+     
+     // Wrap other errors
      throw new McpError(
        ErrorCode.InternalError,
        `Failed to create component: ${error instanceof Error ? error.message : String(error)}`
@@ -2080,7 +3635,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "upload_media_from_path",
-        description: "Upload a media file from a local file path. Avoids context window overflow issues. Maximum size: 10MB.",
+        description: "Upload a media file from a local file path with optional folder support. Avoids context window overflow issues. Maximum size: 10MB.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2095,6 +3650,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             fileType: {
               type: "string",
               description: "Optional: Override the MIME type. If not provided, auto-detects from file extension.",
+            },
+            folderName: {
+              type: "string",
+              description: "Optional: Folder name to upload the file to. If folder doesn't exist, it will be created. If not provided, uploads to root folder.",
             },
           },
           required: ["filePath"]
@@ -2233,12 +3792,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
          inputSchema: {
            type: "object",
            properties: {
-             componentData: {
+             displayName: {
+               type: "string",
+               description: "The display name of the component"
+             },
+             category: {
+               type: "string",
+               description: "The category of the component"
+             },
+             attributes: {
                type: "object",
-               description: "The data for the new component"
+               description: "The attributes (fields) of the component"
+             },
+             icon: {
+               type: "string",
+               description: "Optional icon for the component"
              }
            },
-           required: ["componentData"]
+           required: ["displayName", "category", "attributes"]
          }
        },
        {
@@ -2307,16 +3878,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
   try {
     switch (request.params.name) {
       case "list_content_types": {
-        const contentTypes = await fetchContentTypes();
+        const response = await listContentTypesUnified();
+        
+        if (response.error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Failed to list content types: ${response.error.message}`
+          );
+        }
         
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(contentTypes.map(ct => ({
-              uid: ct.uid,
-              displayName: ct.info.displayName,
-              description: ct.info.description
-            })), null, 2)
+            text: JSON.stringify({
+              contentTypes: response.data.map((ct: any) => ({
+                uid: ct.uid,
+                displayName: ct.info.displayName,
+                description: ct.info.description
+              })),
+              meta: {
+                format: response.format,
+                total: response.data.length
+              }
+            }, null, 2)
           }]
         };
       }
@@ -2344,13 +3928,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           }
         }
         
-        // Fetch entries with query parameters
-        const entries = await fetchEntries(String(contentType), queryParams);
+        // Use enhanced function with unified response
+        const response = await fetchEntriesUnified(String(contentType), queryParams);
+        
+        if (response.error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Failed to get entries: ${response.error.message}`
+          );
+        }
         
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(entries, null, 2)
+            text: JSON.stringify({
+              data: response.data,
+              meta: {
+                ...response.meta,
+                format: response.format
+              }
+            }, null, 2)
           }]
         };
       }
@@ -2379,12 +3976,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           }
         }
         
-        const entry = await fetchEntry(String(contentType), String(id), queryParams);
+        // Use enhanced function with unified response
+        const response = await fetchEntryUnified(String(contentType), String(id), queryParams);
+        
+        if (response.error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Failed to get entry: ${response.error.message}`
+          );
+        }
         
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(entry, null, 2)
+            text: JSON.stringify({
+              data: response.data,
+              meta: {
+                ...response.meta,
+                format: response.format
+              }
+            }, null, 2)
           }]
         };
       }
@@ -2400,12 +4011,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           );
         }
         
-        const entry = await createEntry(contentType, data);
+        // Use enhanced function with unified response
+        const response = await createEntryUnified(contentType, data);
+        
+        if (response.error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Failed to create entry: ${response.error.message}`
+          );
+        }
         
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(entry, null, 2)
+            text: JSON.stringify({
+              data: response.data,
+              meta: {
+                ...response.meta,
+                format: response.format
+              }
+            }, null, 2)
           }]
         };
       }
@@ -2422,25 +4047,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           );
         }
         
-        const entry = await updateEntry(contentType, id, data);
-
-        if (entry) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify(entry, null, 2)
-            }]
-          };
-        } else {
-          // Handle cases where update might succeed but not return the entry
-          console.warn(`[API] Update for ${contentType} ${id} completed, but no updated entry data was returned by the API.`);
-          return {
-            content: [{
-              type: "text",
-              text: `Successfully updated entry ${id} for ${contentType}, but no updated data was returned by the API.`
-            }]
-          };
+        // Use enhanced function with unified response
+        const response = await updateEntryUnified(contentType, id, data);
+        
+        if (response.error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Failed to update entry: ${response.error.message}`
+          );
         }
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              data: response.data,
+              meta: {
+                ...response.meta,
+                format: response.format
+              }
+            }, null, 2)
+          }]
+        };
       }
       
       case "delete_entry": {
@@ -2454,12 +4082,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           );
         }
         
-        await deleteEntry(contentType, id);
+        // Use enhanced function with unified response
+        const response = await deleteEntryUnified(contentType, id);
+        
+        if (response.error) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Failed to delete entry: ${response.error.message}`
+          );
+        }
         
         return {
           content: [{
             type: "text",
-            text: `Successfully deleted entry ${id} from ${contentType}`
+            text: JSON.stringify({
+              data: response.data,
+              meta: {
+                ...response.meta,
+                format: response.format
+              }
+            }, null, 2)
           }]
         };
       }
@@ -2494,6 +4136,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const filePath = String(request.params.arguments?.filePath);
         const fileName = request.params.arguments?.fileName ? String(request.params.arguments.fileName) : undefined;
         const fileType = request.params.arguments?.fileType ? String(request.params.arguments.fileType) : undefined;
+        const folderName = request.params.arguments?.folderName ? String(request.params.arguments.folderName) : undefined;
         
         if (!filePath) {
           throw new McpError(
@@ -2502,7 +4145,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           );
         }
         
-        const media = await uploadMediaFromPath(filePath, fileName, fileType);
+        const media = await uploadMediaFromPath(filePath, fileName, fileType, folderName);
         
         return {
           content: [{
@@ -2620,11 +4263,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case "create_component": {
-        const componentData = request.params.arguments;
-        if (!componentData || typeof componentData !== 'object') {
-          throw new McpError(ErrorCode.InvalidParams, "Component data object is required.");
+        // Direct component fields instead of wrapped componentData
+        const { displayName, category, attributes, icon } = request.params.arguments as any;
+        
+        if (!displayName || !category || !attributes) {
+          throw new McpError(
+            ErrorCode.InvalidParams, 
+            "Missing required fields: displayName, category, attributes"
+          );
         }
+        
+        // Create componentData object for internal function
+        const componentData = { displayName, category, attributes, icon };
+        
+        console.error(`[MCP] Creating component: ${displayName} in category: ${category}`);
         const creationResult = await createComponent(componentData);
+        
         return {
           content: [{
             type: "text",
@@ -2715,6 +4369,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
  */
 async function main() {
   console.error("[Setup] Starting Strapi MCP server");
+  
+  // Version detection
+  detectedStrapiVersion = await detectStrapiVersion();
+  console.error(`[Setup] Target Strapi version: ${detectedStrapiVersion}`);
+  console.error(`[Setup] Migration mode: ${detectedStrapiVersion === 'v5' ? 'v5 native' : 'v4 compatible'}`);
+  
+  // Debug environment variables
+  console.error("[Setup] 🔍 Debug - Environment Variables:");
+  console.error(`[Setup] STRAPI_URL: ${STRAPI_URL}`);
+  console.error(`[Setup] STRAPI_ADMIN_EMAIL: ${STRAPI_ADMIN_EMAIL ? 'SET' : 'NOT SET'}`);
+  console.error(`[Setup] STRAPI_ADMIN_PASSWORD: ${STRAPI_ADMIN_PASSWORD ? 'SET' : 'NOT SET'}`);
+  console.error(`[Setup] STRAPI_API_TOKEN: ${STRAPI_API_TOKEN ? 'SET' : 'NOT SET'}`);
+  console.error(`[Setup] STRAPI_VERSION: ${STRAPI_VERSION}`);
+
+  // Test Strapi connection and authentication BEFORE starting server
+  try {
+    await validateStrapiConnection();
+    console.error("[Setup] ✅ Strapi connection and authentication validated");
+  } catch (connectionError) {
+    console.error("[Setup] ❌ Failed to validate Strapi connection:", connectionError);
+    console.error("[Setup] Server will start but some operations may fail until Strapi is available");
+  }
+  
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[Setup] Strapi MCP server running");
@@ -2786,50 +4463,51 @@ async function validateStrapiConnection(): Promise<void> {
   try {
     console.error("[Setup] Validating connection to Strapi...");
     
-    // Try a simple request to test connectivity - use a valid endpoint
-    // Try the admin/users/me endpoint to test admin authentication
-    // or fall back to a public content endpoint
-    let response;
-    let authMethod = "";
-    
     // First try admin authentication if available
     if (STRAPI_ADMIN_EMAIL && STRAPI_ADMIN_PASSWORD) {
       try {
         // Test admin login
         await loginToStrapiAdmin();
-        response = await makeAdminApiRequest('/admin/users/me');
-        authMethod = "admin credentials";
+        const response = await makeAdminApiRequest('/admin/users/me');
         console.error("[Setup] ✓ Admin authentication successful");
+        
+        // Admin authentication başarılı olduğunda direkt çık
+        console.error("[Setup] ✓ Connection to Strapi successful using admin credentials");
+        connectionValidated = true;
+        return; // Exit early on success
       } catch (adminError) {
         console.error("[Setup] Admin authentication failed, trying API token...");
-        throw adminError; // Fall through to API token test
+        // Fall through to API token test
       }
-    } else {
-      throw new Error("No admin credentials, trying API token");
     }
     
     // If admin failed or not available, try API token
-    if (!response) {
+    if (!connectionValidated && STRAPI_API_TOKEN) {
       try {
         // Try a simple endpoint that should exist - use upload/files to test API token
-        response = await strapiClient.get('/api/upload/files?pagination[limit]=1');
-        authMethod = "API token";
+        const response = await strapiClient.get('/api/upload/files?pagination[limit]=1');
         console.error("[Setup] ✓ API token authentication successful");
+        console.error("[Setup] ✓ Connection to Strapi successful using API token");
+        connectionValidated = true;
+        return;
       } catch (apiError) {
         console.error("[Setup] API token test failed, trying root endpoint...");
         // Last resort - try to hit the root to see if server is running
-        response = await strapiClient.get('/');
-        authMethod = "server connection";
-        console.error("[Setup] ✓ Server is reachable");
+        try {
+          const response = await strapiClient.get('/');
+          console.error("[Setup] ✓ Server is reachable");
+          console.error("[Setup] ✓ Connection to Strapi successful using server connection");
+          connectionValidated = true;
+          return;
+        } catch (rootError) {
+          console.error("[Setup] Root endpoint test also failed");
+        }
       }
     }
     
-    // Check if we got a proper response
-    if (response && response.status >= 200 && response.status < 300) {
-      console.error(`[Setup] ✓ Connection to Strapi successful using ${authMethod}`);
-      connectionValidated = true;
-    } else {
-      throw new Error(`Unexpected response status: ${response?.status}`);
+    // If we reach here, all tests failed
+    if (!connectionValidated) {
+      throw new Error("All connection tests failed");
     }
   } catch (error: any) {
     console.error("[Setup] ✗ Failed to connect to Strapi");
